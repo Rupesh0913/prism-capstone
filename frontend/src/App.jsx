@@ -209,6 +209,7 @@ async function callGateway(key, model, prompt, provider = "", fallback = true) {
     cost:
       parseFloat(
         get(
+          "x-prism-cost-usd",
           "x-prism-cost",
           "x-prism-request-cost",
           "x-request-cost"
