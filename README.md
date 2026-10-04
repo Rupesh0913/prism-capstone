@@ -1131,8 +1131,6 @@ The mock providers are the intended upstreams for development, demos, and load t
 
 ## Language-Agnostic Expectations
 
-Your implementation should provide:
-
 - An OpenAI-compatible `POST /v1/chat/completions` data plane matching `docs/API_CONTRACT.md`, including the `x-prism-*` header contract.
 - Streaming pass-through without buffering.
 - Virtual-key authentication with per-key allowlists, rate limits, and monthly budgets.
