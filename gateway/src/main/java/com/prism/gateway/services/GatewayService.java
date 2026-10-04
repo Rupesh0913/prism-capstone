@@ -28,7 +28,6 @@ public class GatewayService {
     private final SemanticCacheService semanticCacheService;
 
     private static final int MAX_RETRIES = 2;
-
     private static final Duration RETRY_DELAY =
             Duration.ofMillis(200);
 
@@ -68,6 +67,18 @@ public class GatewayService {
     ) {
 
         log.info(
+                "Gateway request | key={} | model={} | provider={} | fallback={}",
+                virtualKey.getVirtualKey(),
+                request.getModel(),
+                provider,
+                fallback
+        );
+
+        // ---------------------------------------------------------
+        // SEMANTIC CACHE
+        // ---------------------------------------------------------
+
+        log.info(
                 "Checking semantic cache | virtualKey={} | model={}",
                 virtualKey.getVirtualKey(),
                 request.getModel()
@@ -78,10 +89,6 @@ public class GatewayService {
                         request,
                         virtualKey
                 );
-
-        // =====================================================
-        // CACHE HIT
-        // =====================================================
 
         if (cached != null) {
 
@@ -102,84 +109,87 @@ public class GatewayService {
             );
         }
 
-        // =====================================================
-        // CACHE MISS
-        // =====================================================
-
         log.info(
                 "SEMANTIC CACHE MISS | virtualKey={} | model={}",
                 virtualKey.getVirtualKey(),
                 request.getModel()
         );
 
+        // ---------------------------------------------------------
+        // PROVIDER REQUEST
+        // ---------------------------------------------------------
+
         return callWithFailover(
                 request,
                 provider,
                 fallback
-        ).doOnNext(result -> {
+        )
+                .doOnNext(result -> {
 
-            ChatCompletionResponse response =
-                    result.getResponse();
+                    ChatCompletionResponse response =
+                            result.getResponse();
 
-            Usage usage =
-                    response.getUsage();
+                    if (response == null) {
+                        return;
+                    }
 
-            // =================================================
-            // TOKEN + COST ACCOUNTING
-            // =================================================
+                    Usage usage =
+                            response.getUsage();
 
-            if (usage != null) {
+                    // -----------------------------------------------------
+                    // TOKEN + COST ACCOUNTING
+                    // -----------------------------------------------------
 
-                rateLimitService.addTokens(
-                        virtualKey,
-                        usage.getTotalTokens()
-                );
+                    if (usage != null) {
 
-                double cost =
-                        costService.calculateCost(
-                                response.getModel(),
-                                usage
+                        rateLimitService.addTokens(
+                                virtualKey,
+                                usage.getTotalTokens()
                         );
 
-                budgetService.addCost(
-                        virtualKey,
-                        cost
-                );
+                        double cost =
+                                costService.calculateCost(
+                                        response.getModel(),
+                                        usage
+                                );
 
-                log.info(
-                        "Request cost: ${}, monthly spent: ${}",
-                        cost,
-                        budgetService.getSpent(virtualKey)
-                );
-            }
+                        budgetService.addCost(
+                                virtualKey,
+                                cost
+                        );
 
-            // =================================================
-            // SEMANTIC CACHE WRITE
-            // =================================================
+                        log.info(
+                                "Request cost: ${}, monthly spent: ${}",
+                                cost,
+                                budgetService.getSpent(virtualKey)
+                        );
+                    }
 
-            log.info(
-                    "Storing response in semantic cache | " +
-                            "virtualKey={} | model={}",
-                    virtualKey.getVirtualKey(),
-                    response.getModel()
-            );
+                    // -----------------------------------------------------
+                    // SEMANTIC CACHE WRITE
+                    // -----------------------------------------------------
 
-            semanticCacheService.put(
-                    request,
-                    virtualKey,
-                    response
-            );
+                    log.info(
+                            "Storing response in semantic cache | virtualKey={} | model={}",
+                            virtualKey.getVirtualKey(),
+                            response.getModel()
+                    );
 
-            log.info(
-                    "Semantic cache write completed | virtualKey={}",
-                    virtualKey.getVirtualKey()
-            );
-        });
+                    semanticCacheService.put(
+                            request,
+                            virtualKey,
+                            response
+                    );
+
+                    log.info(
+                            "Semantic cache write completed | virtualKey={}",
+                            virtualKey.getVirtualKey()
+                    );
+                });
     }
 
-
     // =========================================================
-    // NORMAL REQUEST + PROVIDER FAILOVER
+    // PROVIDER FAILOVER
     // =========================================================
 
     private Mono<GatewayResponse> callWithFailover(
@@ -188,166 +198,146 @@ public class GatewayService {
             boolean fallback
     ) {
 
-        /*
-         * Resolve the model first.
-         *
-         * If request.model == "auto":
-         *
-         *      AutoRoutingService
-         *              ↓
-         *        fast / smart
-         *              ↓
-         *        ModelRouter
-         *              ↓
-         *    actual provider models
-         *
-         * For explicit fast/smart requests, the existing
-         * ModelRouter behavior is preserved.
-         */
         ModelRoute route =
                 resolveRoute(request);
 
-        // =====================================================
+        log.info(
+                "Provider routing | requestedProvider={} | fallback={} | primary={} | fallbackModel={}",
+                provider,
+                fallback,
+                route.getPrimaryModel(),
+                route.getFallbackModel()
+        );
+
+        // =========================================================
         // EXPLICIT PROVIDER
-        // =====================================================
+        // =========================================================
 
         if (provider != null && !provider.isBlank()) {
 
-            // =================================================
-            // ALPHA
-            // =================================================
+            // -----------------------------------------------------
+            // EXPLICIT ALPHA
+            // -----------------------------------------------------
 
             if ("alpha".equalsIgnoreCase(provider)) {
 
-                return retry(
-                        alphaProvider.complete(
-                                withModel(
-                                        request,
-                                        route.getPrimaryModel()
+                return callProviderWithRetry(
+                        alphaProvider,
+                        withModel(
+                                request,
+                                route.getPrimaryModel()
+                        ),
+                        "alpha"
+                )
+                        .map(response ->
+                                createGatewayResponse(
+                                        response,
+                                        "alpha",
+                                        false
                                 )
                         )
-                ).map(response -> {
+                        .onErrorResume(error -> {
 
-                    double cost =
-                            costService.calculateCost(
-                                    response.getModel(),
-                                    response.getUsage()
+                            log.error(
+                                    "Alpha provider failed | fallback={} | error={}",
+                                    fallback,
+                                    rootMessage(error)
                             );
 
-                    return new GatewayResponse(
-                            response,
-                            "alpha",
-                            false,
-                            cost,
-                            false
-                    );
+                            if (!fallback) {
+                                return Mono.error(error);
+                            }
 
-                }).onErrorResume(error -> {
+                            log.warn(
+                                    "ALPHA FAILED -> FALLING BACK TO BETA | model={}",
+                                    route.getFallbackModel()
+                            );
 
-                    if (!fallback) {
-                        return Mono.error(error);
-                    }
-
-                    log.info(
-                            "Alpha failed. Falling back to Beta."
-                    );
-
-                    return retry(
-                            betaProvider.complete(
+                            return callProviderWithRetry(
+                                    betaProvider,
                                     withModel(
                                             request,
                                             route.getFallbackModel()
-                                    )
+                                    ),
+                                    "beta"
                             )
-                    ).map(response -> {
-
-                        double cost =
-                                costService.calculateCost(
-                                        response.getModel(),
-                                        response.getUsage()
-                                );
-
-                        return new GatewayResponse(
-                                response,
-                                "beta",
-                                true,
-                                cost,
-                                false
-                        );
-                    });
-                });
+                                    .map(response ->
+                                            createGatewayResponse(
+                                                    response,
+                                                    "beta",
+                                                    true
+                                            )
+                                    )
+                                    .doOnError(betaError ->
+                                            log.error(
+                                                    "Beta fallback also failed | error={}",
+                                                    rootMessage(betaError)
+                                            )
+                                    );
+                        });
             }
 
-
-            // =================================================
-            // BETA
-            // =================================================
+            // -----------------------------------------------------
+            // EXPLICIT BETA
+            // -----------------------------------------------------
 
             if ("beta".equalsIgnoreCase(provider)) {
 
-                return retry(
-                        betaProvider.complete(
-                                withModel(
-                                        request,
-                                        route.getFallbackModel()
+                return callProviderWithRetry(
+                        betaProvider,
+                        withModel(
+                                request,
+                                route.getFallbackModel()
+                        ),
+                        "beta"
+                )
+                        .map(response ->
+                                createGatewayResponse(
+                                        response,
+                                        "beta",
+                                        false
                                 )
                         )
-                ).map(response -> {
+                        .onErrorResume(error -> {
 
-                    double cost =
-                            costService.calculateCost(
-                                    response.getModel(),
-                                    response.getUsage()
+                            log.error(
+                                    "Beta provider failed | fallback={} | error={}",
+                                    fallback,
+                                    rootMessage(error)
                             );
 
-                    return new GatewayResponse(
-                            response,
-                            "beta",
-                            false,
-                            cost,
-                            false
-                    );
+                            if (!fallback) {
+                                return Mono.error(error);
+                            }
 
-                }).onErrorResume(error -> {
+                            log.warn(
+                                    "BETA FAILED -> FALLING BACK TO ALPHA | model={}",
+                                    route.getPrimaryModel()
+                            );
 
-                    if (!fallback) {
-                        return Mono.error(error);
-                    }
-
-                    log.info(
-                            "Beta failed. Falling back to Alpha."
-                    );
-
-                    return retry(
-                            alphaProvider.complete(
+                            return callProviderWithRetry(
+                                    alphaProvider,
                                     withModel(
                                             request,
                                             route.getPrimaryModel()
-                                    )
+                                    ),
+                                    "alpha"
                             )
-                    ).map(response -> {
-
-                        double cost =
-                                costService.calculateCost(
-                                        response.getModel(),
-                                        response.getUsage()
-                                );
-
-                        return new GatewayResponse(
-                                response,
-                                "alpha",
-                                true,
-                                cost,
-                                false
-                        );
-                    });
-                });
+                                    .map(response ->
+                                            createGatewayResponse(
+                                                    response,
+                                                    "alpha",
+                                                    true
+                                            )
+                                    )
+                                    .doOnError(alphaError ->
+                                            log.error(
+                                                    "Alpha fallback also failed | error={}",
+                                                    rootMessage(alphaError)
+                                            )
+                                    );
+                        });
             }
-
-
-            // =================================================
-            // UNKNOWN PROVIDER
-            // =================================================
 
             return Mono.error(
                     new IllegalArgumentException(
@@ -356,76 +346,181 @@ public class GatewayService {
             );
         }
 
-
-        // =====================================================
+        // =========================================================
         // AUTOMATIC PROVIDER SELECTION
-        // =====================================================
+        // =========================================================
 
         log.info(
-                "Automatic provider selection | primary={} | fallback={}",
+                "Automatic provider selection | primary={} | fallback={} | fallbackEnabled={}",
                 route.getPrimaryModel(),
-                route.getFallbackModel()
+                route.getFallbackModel(),
+                fallback
         );
 
-        return retry(
-                alphaProvider.complete(
-                        withModel(
-                                request,
-                                route.getPrimaryModel()
+        return callProviderWithRetry(
+                alphaProvider,
+                withModel(
+                        request,
+                        route.getPrimaryModel()
+                ),
+                "alpha"
+        )
+                .map(response ->
+                        createGatewayResponse(
+                                response,
+                                "alpha",
+                                false
                         )
                 )
-        ).map(response -> {
+                .onErrorResume(error -> {
 
-            double cost =
+                    log.error(
+                            "Primary Alpha provider failed | fallback={} | error={}",
+                            fallback,
+                            rootMessage(error)
+                    );
+
+                    /*
+                     * IMPORTANT:
+                     *
+                     * If fallback is enabled, Beta MUST be attempted.
+                     */
+                    if (fallback) {
+
+                        log.warn(
+                                "PRIMARY ALPHA FAILED -> FALLING BACK TO BETA | model={}",
+                                route.getFallbackModel()
+                        );
+
+                        return callProviderWithRetry(
+                                betaProvider,
+                                withModel(
+                                        request,
+                                        route.getFallbackModel()
+                                ),
+                                "beta"
+                        )
+                                .map(response ->
+                                        createGatewayResponse(
+                                                response,
+                                                "beta",
+                                                true
+                                        )
+                                )
+                                .doOnError(betaError ->
+                                        log.error(
+                                                "Beta fallback also failed | error={}",
+                                                rootMessage(betaError)
+                                        )
+                                );
+                    }
+
+                    return Mono.error(error);
+                });
+    }
+
+    // =========================================================
+    // PROVIDER CALL + RETRY
+    // =========================================================
+
+    private Mono<ChatCompletionResponse> callProviderWithRetry(
+            LlmProvider provider,
+            ChatCompletionRequest request,
+            String providerName
+    ) {
+        log.info(
+                "Calling provider | provider={} | model={}",
+                providerName,
+                request.getModel()
+        );
+
+        return provider
+                .complete(request)
+
+                .doOnSuccess(response ->
+                        log.info(
+                                "Provider success | provider={} | model={}",
+                                providerName,
+                                response != null
+                                        ? response.getModel()
+                                        : "null"
+                        )
+                )
+
+                .doOnError(error ->
+                        log.warn(
+                                "Provider attempt failed | provider={} | model={} | error={}",
+                                providerName,
+                                request.getModel(),
+                                rootMessage(error)
+                        )
+                )
+
+                .retryWhen(
+                        Retry.fixedDelay(
+                                        MAX_RETRIES,
+                                        RETRY_DELAY
+                                )
+                                .doBeforeRetry(signal ->
+                                        log.warn(
+                                                "Retrying provider | provider={} | model={} | retry={}/{} | error={}",
+                                                providerName,
+                                                request.getModel(),
+                                                signal.totalRetries() + 1,
+                                                MAX_RETRIES,
+                                                rootMessage(signal.failure())
+                                        )
+                                )
+
+                                // IMPORTANT:
+                                // After retries are exhausted, propagate the
+                                // ORIGINAL provider exception instead of wrapping
+                                // it inside RetryExhaustedException.
+                                .onRetryExhaustedThrow(
+                                        (spec, signal) -> signal.failure()
+                                )
+                );
+    }
+
+    // =========================================================
+    // CREATE GATEWAY RESPONSE
+    // =========================================================
+
+    private GatewayResponse createGatewayResponse(
+            ChatCompletionResponse response,
+            String provider,
+            boolean fallbackUsed
+    ) {
+
+        double cost = 0.0;
+
+        if (response != null && response.getUsage() != null) {
+
+            cost =
                     costService.calculateCost(
                             response.getModel(),
                             response.getUsage()
                     );
+        }
 
-            return new GatewayResponse(
-                    response,
-                    "alpha",
-                    false,
-                    cost,
-                    false
-            );
+        log.info(
+                "Gateway response | provider={} | fallbackUsed={} | model={} | cost={}",
+                provider,
+                fallbackUsed,
+                response != null
+                        ? response.getModel()
+                        : "null",
+                cost
+        );
 
-        }).onErrorResume(error -> {
-
-            if (!fallback) {
-                return Mono.error(error);
-            }
-
-            log.info(
-                    "Primary provider failed. Falling back to Beta."
-            );
-
-            return retry(
-                    betaProvider.complete(
-                            withModel(
-                                    request,
-                                    route.getFallbackModel()
-                            )
-                    )
-            ).map(response -> {
-
-                double cost =
-                        costService.calculateCost(
-                                response.getModel(),
-                                response.getUsage()
-                        );
-
-                return new GatewayResponse(
-                        response,
-                        "beta",
-                        true,
-                        cost,
-                        false
-                );
-            });
-        });
+        return new GatewayResponse(
+                response,
+                provider,
+                fallbackUsed,
+                cost,
+                false
+        );
     }
-
 
     // =========================================================
     // MODEL ROUTING
@@ -438,10 +533,6 @@ public class GatewayService {
         String requestedModel =
                 request.getModel();
 
-        // -----------------------------------------------------
-        // Explicit model
-        // -----------------------------------------------------
-
         if (requestedModel == null ||
                 requestedModel.isBlank()) {
 
@@ -450,9 +541,9 @@ public class GatewayService {
             );
         }
 
-        // -----------------------------------------------------
-        // NLP / EMBEDDING BASED AUTO ROUTING
-        // -----------------------------------------------------
+        // ---------------------------------------------------------
+        // AUTO ROUTING
+        // ---------------------------------------------------------
 
         if ("auto".equalsIgnoreCase(requestedModel)) {
 
@@ -478,49 +569,26 @@ public class GatewayService {
             }
 
             log.info(
-                    "AUTO ROUTING | requestedModel={} | " +
-                            "resolvedModel={} | reason={} | confidence={}",
-                    decision.getRequestedModel(),
-                    decision.getResolvedModel(),
+                    "AUTO ROUTING | requestedModel=auto | resolvedModel={} | reason={} | confidence={}",
+                    resolvedModel,
                     decision.getReason(),
                     decision.getConfidence()
             );
 
-            /*
-             * Convert:
-             *
-             *      auto
-             *       ↓
-             *      fast / smart
-             *
-             * Then let ModelRouter convert:
-             *
-             *      fast
-             *       ↓
-             * alpha-small / beta-small
-             *
-             *      smart
-             *       ↓
-             * alpha-large / beta-large
-             */
-            ChatCompletionRequest routedRequest =
+            return modelRouter.resolve(
                     withModel(
                             request,
                             resolvedModel
-                    );
-
-            return modelRouter.resolve(
-                    routedRequest
+                    )
             );
         }
 
-        // -----------------------------------------------------
-        // Explicit fast / smart
-        // -----------------------------------------------------
+        // ---------------------------------------------------------
+        // EXPLICIT MODEL
+        // ---------------------------------------------------------
 
         return modelRouter.resolve(request);
     }
-
 
     // =========================================================
     // COPY REQUEST WITH SELECTED MODEL
@@ -541,9 +609,8 @@ public class GatewayService {
         return copy;
     }
 
-
     // =========================================================
-    // STREAMING REQUEST
+    // STREAMING
     // =========================================================
 
     public Mono<GatewayStreamResponse> stream(
@@ -553,9 +620,7 @@ public class GatewayService {
             VirtualKey virtualKey
     ) {
 
-        budgetService.checkBudget(
-                virtualKey
-        );
+        budgetService.checkBudget(virtualKey);
 
         return streamWithFailover(
                 request,
@@ -564,7 +629,6 @@ public class GatewayService {
                 virtualKey
         );
     }
-
 
     // =========================================================
     // STREAM FAILOVER
@@ -577,19 +641,8 @@ public class GatewayService {
             VirtualKey virtualKey
     ) {
 
-        /*
-         * IMPORTANT:
-         *
-         * The exact same NLP auto-routing logic is used
-         * for streaming requests.
-         */
         ModelRoute route =
                 resolveRoute(request);
-
-
-        // =====================================================
-        // EXPLICIT ALPHA
-        // =====================================================
 
         if ("alpha".equalsIgnoreCase(provider)) {
 
@@ -601,11 +654,6 @@ public class GatewayService {
             );
         }
 
-
-        // =====================================================
-        // EXPLICIT BETA
-        // =====================================================
-
         if ("beta".equalsIgnoreCase(provider)) {
 
             return createBetaStream(
@@ -616,18 +664,7 @@ public class GatewayService {
             );
         }
 
-
-        // =====================================================
-        // AUTOMATIC PROVIDER SELECTION
-        // =====================================================
-
-        log.info(
-                "Automatic streaming provider selection | " +
-                        "primary={} | fallback={}",
-                route.getPrimaryModel(),
-                route.getFallbackModel()
-        );
-
+        // Automatic provider selection
         return createAlphaStream(
                 request,
                 route,
@@ -635,7 +672,6 @@ public class GatewayService {
                 fallback
         );
     }
-
 
     // =========================================================
     // ALPHA STREAM
@@ -657,6 +693,12 @@ public class GatewayService {
                         route.getPrimaryModel()
                 );
 
+        log.info(
+                "Starting Alpha stream | model={} | fallback={}",
+                alphaRequest.getModel(),
+                fallback
+        );
+
         Flux<ChatCompletionChunk> alphaStream =
                 alphaProvider
                         .stream(alphaRequest)
@@ -673,12 +715,21 @@ public class GatewayService {
 
                         .retryWhen(
                                 Retry.fixedDelay(
-                                        MAX_RETRIES,
-                                        RETRY_DELAY
-                                ).filter(
-                                        error ->
-                                                !alphaEmitted.get()
-                                )
+                                                MAX_RETRIES,
+                                                RETRY_DELAY
+                                        )
+                                        .doBeforeRetry(signal ->
+                                                log.warn(
+                                                        "Retrying Alpha stream | retry={}/{} | error={}",
+                                                        signal.totalRetries() + 1,
+                                                        MAX_RETRIES,
+                                                        rootMessage(signal.failure())
+                                                )
+                                        )
+                                        .filter(
+                                                error ->
+                                                        !alphaEmitted.get()
+                                        )
                         );
 
         return alphaStream
@@ -694,25 +745,22 @@ public class GatewayService {
 
                 .onErrorResume(error -> {
 
-                    /*
-                     * Alpha already emitted data.
-                     *
-                     * We cannot safely switch to Beta.
-                     */
+                    log.error(
+                            "Alpha streaming failed | fallback={} | error={}",
+                            fallback,
+                            rootMessage(error)
+                    );
+
                     if (alphaEmitted.get()) {
                         return Mono.error(error);
                     }
 
-                    /*
-                     * No fallback requested.
-                     */
                     if (!fallback) {
                         return Mono.error(error);
                     }
 
-                    log.info(
-                            "Alpha streaming failed before " +
-                                    "emitting. Falling back to Beta."
+                    log.warn(
+                            "ALPHA STREAM FAILED -> FALLING BACK TO BETA"
                     );
 
                     return createBetaStream(
@@ -723,7 +771,6 @@ public class GatewayService {
                     );
                 });
     }
-
 
     // =========================================================
     // BETA STREAM
@@ -745,6 +792,12 @@ public class GatewayService {
                         route.getFallbackModel()
                 );
 
+        log.info(
+                "Starting Beta stream | model={} | fallback={}",
+                betaRequest.getModel(),
+                fallback
+        );
+
         Flux<ChatCompletionChunk> betaStream =
                 betaProvider
                         .stream(betaRequest)
@@ -761,12 +814,21 @@ public class GatewayService {
 
                         .retryWhen(
                                 Retry.fixedDelay(
-                                        MAX_RETRIES,
-                                        RETRY_DELAY
-                                ).filter(
-                                        error ->
-                                                !betaEmitted.get()
-                                )
+                                                MAX_RETRIES,
+                                                RETRY_DELAY
+                                        )
+                                        .doBeforeRetry(signal ->
+                                                log.warn(
+                                                        "Retrying Beta stream | retry={}/{} | error={}",
+                                                        signal.totalRetries() + 1,
+                                                        MAX_RETRIES,
+                                                        rootMessage(signal.failure())
+                                                )
+                                        )
+                                        .filter(
+                                                error ->
+                                                        !betaEmitted.get()
+                                        )
                         );
 
         return betaStream
@@ -782,25 +844,22 @@ public class GatewayService {
 
                 .onErrorResume(error -> {
 
-                    /*
-                     * Beta already emitted data.
-                     *
-                     * We cannot safely switch to Alpha.
-                     */
+                    log.error(
+                            "Beta streaming failed | fallback={} | error={}",
+                            fallback,
+                            rootMessage(error)
+                    );
+
                     if (betaEmitted.get()) {
                         return Mono.error(error);
                     }
 
-                    /*
-                     * No fallback requested.
-                     */
                     if (!fallback) {
                         return Mono.error(error);
                     }
 
-                    log.info(
-                            "Beta streaming failed before " +
-                                    "emitting. Falling back to Alpha."
+                    log.warn(
+                            "BETA STREAM FAILED -> FALLING BACK TO ALPHA"
                     );
 
                     return createAlphaStream(
@@ -812,9 +871,8 @@ public class GatewayService {
                 });
     }
 
-
     // =========================================================
-    // STREAM USAGE + TOKEN ACCOUNTING
+    // STREAM USAGE + COST
     // =========================================================
 
     private void addStreamUsage(
@@ -851,27 +909,40 @@ public class GatewayService {
         );
 
         log.info(
-                "Streaming request cost: ${}, " +
-                        "monthly spent: ${}",
+                "Streaming request cost: ${}, monthly spent: ${}",
                 cost,
                 budgetService.getSpent(virtualKey)
         );
     }
 
-
     // =========================================================
-    // NORMAL REQUEST RETRY
+    // ERROR MESSAGE
     // =========================================================
 
-    private <T> Mono<T> retry(
-            Mono<T> request
+    private String rootMessage(
+            Throwable error
     ) {
 
-        return request.retryWhen(
-                Retry.fixedDelay(
-                        MAX_RETRIES,
-                        RETRY_DELAY
-                )
-        );
+        if (error == null) {
+            return "unknown";
+        }
+
+        Throwable current = error;
+
+        while (current.getCause() != null) {
+            current = current.getCause();
+        }
+
+        String message =
+                current.getMessage();
+
+        if (message == null ||
+                message.isBlank()) {
+
+            return current.getClass()
+                    .getSimpleName();
+        }
+
+        return message;
     }
 }
